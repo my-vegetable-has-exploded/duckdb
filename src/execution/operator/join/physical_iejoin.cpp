@@ -253,15 +253,17 @@ struct IEJoinUnion {
 	//! P
 	vector<idx_t> p;
 
-	//! B
-	vector<validity_t> bit_array;
-	ValidityMask bit_mask;
+	std::map<idx_t, idx_t> id_map;
+	std::map<idx_t, idx_t>::iterator id_iter;
+	// //! B
+	// vector<validity_t> bit_array;
+	// ValidityMask bit_mask;
 
-	//! Bloom Filter
-	static constexpr idx_t BLOOM_CHUNK_BITS = 1024;
-	idx_t bloom_count;
-	vector<validity_t> bloom_array;
-	ValidityMask bloom_filter;
+	// //! Bloom Filter
+	// static constexpr idx_t BLOOM_CHUNK_BITS = 1024;
+	// idx_t bloom_count;
+	// vector<validity_t> bloom_array;
+	// ValidityMask bloom_filter;
 
 	//! Iteration state
 	idx_t n;
@@ -446,13 +448,14 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 
 	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
-	bit_array.resize(ValidityMask::EntryCount(n), 0);
-	bit_mask.Initialize(bit_array.data());
+	id_map.clear();
+	// bit_array.resize(ValidityMask::EntryCount(n), 0);
+	// bit_mask.Initialize(bit_array.data());
 
-	// Bloom filter
-	bloom_count = (n + (BLOOM_CHUNK_BITS - 1)) / BLOOM_CHUNK_BITS;
-	bloom_array.resize(ValidityMask::EntryCount(bloom_count), 0);
-	bloom_filter.Initialize(bloom_array.data());
+	// // Bloom filter
+	// bloom_count = (n + (BLOOM_CHUNK_BITS - 1)) / BLOOM_CHUNK_BITS;
+	// bloom_array.resize(ValidityMask::EntryCount(bloom_count), 0);
+	// bloom_filter.Initialize(bloom_array.data());
 
 	// 11. for(i←1 to n) do
 	const auto &cmp2 = op.conditions[1].comparison;
@@ -528,8 +531,29 @@ bool IEJoinUnion::NextRow() {
 			const auto p2 = p[off2->GetIndex()];
 			if (li[p2] < 0) {
 				// Only mark rhs matches.
-				bit_mask.SetValid(p2);
-				bloom_filter.SetValid(p2 / BLOOM_CHUNK_BITS);
+				// bit_mask.SetValid(p2);
+				// bloom_filter.SetValid(p2 / BLOOM_CHUNK_BITS);
+				id_t start, end;
+				auto next = id_map.lower_bound(p2);
+				auto prev = next;
+				if (next != id_map.begin()) {
+					prev = std::prev(next);
+				}
+				if (prev != id_map.end() && prev->second == p2) {
+					if (next != id_map.end() && next->first == p2 + 1) {
+						end = next->second;
+						id_map.erase(next);
+					} else {
+						end = p2;
+					}
+					prev->second = end;
+				} else if (next != id_map.end() && next->first == p2 + 1) {
+					end = next->second;
+					id_map.erase(next);
+					id_map[p2] = end;
+				} else {
+					id_map[p2] = p2 + 1;
+				}
 			}
 		}
 
@@ -541,50 +565,52 @@ bool IEJoinUnion::NextRow() {
 		// and that is where we should start scanning B from
 		j = SearchL1(pos);
 
+		id_iter = id_map.lower_bound(j);
+
 		return true;
 	}
 	return false;
 }
 
-static idx_t NextValid(const ValidityMask &bits, idx_t j, const idx_t n) {
-	if (j >= n) {
-		return n;
-	}
+// static idx_t NextValid(const ValidityMask &bits, idx_t j, const idx_t n) {
+// 	if (j >= n) {
+// 		return n;
+// 	}
 
-	// We can do a first approximation by checking entries one at a time
-	// which gives 64:1.
-	idx_t entry_idx, idx_in_entry;
-	bits.GetEntryIndex(j, entry_idx, idx_in_entry);
-	auto entry = bits.GetValidityEntry(entry_idx++);
+// 	// We can do a first approximation by checking entries one at a time
+// 	// which gives 64:1.
+// 	idx_t entry_idx, idx_in_entry;
+// 	bits.GetEntryIndex(j, entry_idx, idx_in_entry);
+// 	auto entry = bits.GetValidityEntry(entry_idx++);
 
-	// Trim the bits before the start position
-	entry &= (ValidityMask::ValidityBuffer::MAX_ENTRY << idx_in_entry);
+// 	// Trim the bits before the start position
+// 	entry &= (ValidityMask::ValidityBuffer::MAX_ENTRY << idx_in_entry);
 
-	// Check the non-ragged entries
-	for (const auto entry_count = bits.EntryCount(n); entry_idx < entry_count; ++entry_idx) {
-		if (entry) {
-			for (; idx_in_entry < bits.BITS_PER_VALUE; ++idx_in_entry, ++j) {
-				if (bits.RowIsValid(entry, idx_in_entry)) {
-					return j;
-				}
-			}
-		} else {
-			j += bits.BITS_PER_VALUE - idx_in_entry;
-		}
+// 	// Check the non-ragged entries
+// 	for (const auto entry_count = bits.EntryCount(n); entry_idx < entry_count; ++entry_idx) {
+// 		if (entry) {
+// 			for (; idx_in_entry < bits.BITS_PER_VALUE; ++idx_in_entry, ++j) {
+// 				if (bits.RowIsValid(entry, idx_in_entry)) {
+// 					return j;
+// 				}
+// 			}
+// 		} else {
+// 			j += bits.BITS_PER_VALUE - idx_in_entry;
+// 		}
 
-		entry = bits.GetValidityEntry(entry_idx);
-		idx_in_entry = 0;
-	}
+// 		entry = bits.GetValidityEntry(entry_idx);
+// 		idx_in_entry = 0;
+// 	}
 
-	// Check the final entry
-	for (; j < n; ++idx_in_entry, ++j) {
-		if (bits.RowIsValid(entry, idx_in_entry)) {
-			return j;
-		}
-	}
+// 	// Check the final entry
+// 	for (; j < n; ++idx_in_entry, ++j) {
+// 		if (bits.RowIsValid(entry, idx_in_entry)) {
+// 			return j;
+// 		}
+// 	}
 
-	return j;
-}
+// 	return j;
+// }
 
 idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel) {
 	// 8. initialize join result as an empty list for tuple pairs
@@ -593,39 +619,61 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 	// 11. for(i←1 to n) do
 	while (i < n) {
 		// 13. for (j ← pos+eqOff to n) do
-		for (;;) {
-			// 14. if B[j] = 1 then
+		// for (;;) {
+		// 	// 14. if B[j] = 1 then
 
-			//	Use the Bloom filter to find candidate blocks
-			while (j < n) {
-				auto bloom_begin = NextValid(bloom_filter, j / BLOOM_CHUNK_BITS, bloom_count) * BLOOM_CHUNK_BITS;
-				auto bloom_end = MinValue<idx_t>(n, bloom_begin + BLOOM_CHUNK_BITS);
+		// 	//	Use the Bloom filter to find candidate blocks
+		// 	while (j < n) {
+		// 		auto bloom_begin = NextValid(bloom_filter, j / BLOOM_CHUNK_BITS, bloom_count) * BLOOM_CHUNK_BITS;
+		// 		auto bloom_end = MinValue<idx_t>(n, bloom_begin + BLOOM_CHUNK_BITS);
 
-				j = MaxValue<idx_t>(j, bloom_begin);
-				j = NextValid(bit_mask, j, bloom_end);
-				if (j < bloom_end) {
-					break;
-				}
+		// 		j = MaxValue<idx_t>(j, bloom_begin);
+		// 		j = NextValid(bit_mask, j, bloom_end);
+		// 		if (j < bloom_end) {
+		// 			break;
+		// 		}
+		// 	}
+
+		// 	if (j >= n) {
+		// 		break;
+		// 	}
+
+		// 	// Filter out tuples with the same sign (they come from the same table)
+		// 	const auto rrid = li[j];
+		// 	++j;
+
+		// 	D_ASSERT(lrid > 0 && rrid < 0);
+		// 	// 15. add tuples w.r.t. (L1[j], L1[i]) to join result
+		// 	lsel.set_index(result_count, sel_t(+lrid - 1));
+		// 	rsel.set_index(result_count, sel_t(-rrid - 1));
+		// 	++result_count;
+		// 	if (result_count == STANDARD_VECTOR_SIZE) {
+		// 		// out of space!
+		// 		return result_count;
+		// 	}
+		// }
+
+		for (; id_iter != id_map.end(); ++id_iter) {
+			auto start = MaxValue(id_iter->first, j);
+			auto end = id_iter->second;
+			auto rest = STANDARD_VECTOR_SIZE - result_count;
+			auto tims = MinValue(rest, end - start);
+			for (auto t = 0; t < tims; ++start, ++t) {
+				// Filter out tuples with the same sign (they come from the same table)
+				const auto rrid = li[start];
+				D_ASSERT(lrid > 0 && rrid < 0);
+				// 15. add tuples w.r.t. (L1[j], L1[i]) to join result
+				lsel.set_index(result_count + t, sel_t(+lrid - 1));
+				rsel.set_index(result_count + t, sel_t(-rrid - 1));
 			}
-
-			if (j >= n) {
-				break;
-			}
-
-			// Filter out tuples with the same sign (they come from the same table)
-			const auto rrid = li[j];
-			++j;
-
-			D_ASSERT(lrid > 0 && rrid < 0);
-			// 15. add tuples w.r.t. (L1[j], L1[i]) to join result
-			lsel.set_index(result_count, sel_t(+lrid - 1));
-			rsel.set_index(result_count, sel_t(-rrid - 1));
-			++result_count;
+			result_count += tims;
+			j += tims;
 			if (result_count == STANDARD_VECTOR_SIZE) {
 				// out of space!
 				return result_count;
 			}
 		}
+
 		++i;
 
 		if (!NextRow()) {
