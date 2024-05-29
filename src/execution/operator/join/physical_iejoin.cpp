@@ -1,5 +1,6 @@
 #include "duckdb/execution/operator/join/physical_iejoin.hpp"
 
+#include "duckdb/common/btree_map.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/sort/sort.hpp"
@@ -253,8 +254,8 @@ struct IEJoinUnion {
 	//! P
 	vector<idx_t> p;
 
-	std::map<idx_t, idx_t> id_map;
-	std::map<idx_t, idx_t>::iterator id_iter;
+	btree::btree_map<idx_t, idx_t> id_map;
+	btree::btree_map<idx_t, idx_t>::iterator id_iter;
 	// //! B
 	// vector<validity_t> bit_array;
 	// ValidityMask bit_mask;
@@ -449,6 +450,7 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
 	id_map.clear();
+	id_iter = id_map.end();
 	// bit_array.resize(ValidityMask::EntryCount(n), 0);
 	// bit_mask.Initialize(bit_array.data());
 
@@ -533,21 +535,23 @@ bool IEJoinUnion::NextRow() {
 				// Only mark rhs matches.
 				// bit_mask.SetValid(p2);
 				// bloom_filter.SetValid(p2 / BLOOM_CHUNK_BITS);
-				id_t start, end;
+				id_t end;
 				auto next = id_map.lower_bound(p2);
 				auto prev = next;
 				if (next != id_map.begin()) {
 					prev = std::prev(next);
-				}
-				if (prev != id_map.end() && prev->second == p2) {
-					if (next != id_map.end() && next->first == p2 + 1) {
-						end = next->second;
-						id_map.erase(next);
-					} else {
-						end = p2;
+					if (prev->second == p2) {
+						if (next != id_map.end() && next->first == p2 + 1) {
+							end = next->second;
+							id_map.erase(next);
+						} else {
+							end = p2 + 1;
+						}
+						prev->second = end;
+						continue;
 					}
-					prev->second = end;
-				} else if (next != id_map.end() && next->first == p2 + 1) {
+				}
+				if (next != id_map.end() && next->first == p2 + 1) {
 					end = next->second;
 					id_map.erase(next);
 					id_map[p2] = end;
@@ -566,6 +570,12 @@ bool IEJoinUnion::NextRow() {
 		j = SearchL1(pos);
 
 		id_iter = id_map.lower_bound(j);
+		if (id_iter != id_map.begin()) {
+			auto prev = std::prev(id_iter);
+			if (j < prev->second) {
+				id_iter = prev;
+			}
+		}
 
 		return true;
 	}
@@ -667,7 +677,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 				rsel.set_index(result_count + t, sel_t(-rrid - 1));
 			}
 			result_count += tims;
-			j += tims;
+			j = start;
 			if (result_count == STANDARD_VECTOR_SIZE) {
 				// out of space!
 				return result_count;
