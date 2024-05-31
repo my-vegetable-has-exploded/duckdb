@@ -251,6 +251,10 @@ struct IEJoinUnion {
 
 	//! Li
 	vector<int64_t> li;
+	//!	check the number index of the right table
+	vector<pair<int64_t, int64_t>> j_r_index;
+	//! only keep the right table index from li
+	vector<int64_t> li_r;
 	//! P
 	vector<idx_t> p;
 
@@ -268,8 +272,8 @@ struct IEJoinUnion {
 
 	//! Iteration state
 	idx_t n;
-	idx_t i;
-	idx_t j;
+	idx_t i_l;
+	idx_t j_r;
 	unique_ptr<SBIterator> op1;
 	unique_ptr<SBIterator> off1;
 	unique_ptr<SBIterator> op2;
@@ -349,7 +353,7 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 
 IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, SortedTable &t1, const idx_t b1,
                          SortedTable &t2, const idx_t b2)
-    : n(0), i(0) {
+    : n(0), i_l(0), j_r(0) {
 	// input : query Q with 2 join predicates t1.X op1 t2.X' and t1.Y op2 t2.Y', tables T, T' of sizes m and n resp.
 	// output: a list of tuple pairs (ti , tj)
 	// Note that T/T' are already sorted on X/X' and contain the payload data
@@ -418,6 +422,21 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	// We don't actually need the L1 column, just its sort key, which is in the sort blocks
 	li = ExtractColumn<int64_t>(*l1, types.size() - 1);
 
+	n = l1->count.load();
+	j_r_index.resize(n);
+	li_r.resize(n);
+	idx_t j_length = 0;
+	for (idx_t i = 0; i < n; ++i) {
+		// precompute the right table index for each left table index
+		if (li[i] < 0) {
+			j_r_index[i] = make_pair(li[i], j_length);
+			li_r[j_length] = -li[i];
+			++j_length;
+		} else {
+			j_r_index[i] = make_pair(li[i], j_length);
+		}
+	}
+
 	// 4. if (op2 ∈ {>, ≥}) sort L2 in ascending order
 	// 5. else if (op2 ∈ {<, ≤}) sort L2 in descending order
 
@@ -463,8 +482,8 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	const auto &cmp2 = op.conditions[1].comparison;
 	op2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
 	off2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
-	i = 0;
-	j = 0;
+	i_l = 0;
+	j_r = 0;
 	(void)NextRow();
 }
 
@@ -516,26 +535,28 @@ idx_t IEJoinUnion::SearchL1(idx_t pos) {
 }
 
 bool IEJoinUnion::NextRow() {
-	for (; i < n; ++i) {
+	for (; i_l < n; ++i_l) {
 		// 12. pos ← P[i]
-		auto pos = p[i];
-		lrid = li[pos];
+		auto pos = p[i_l];
+		lrid = j_r_index[pos].first;
 		if (lrid < 0) {
 			continue;
 		}
 
 		// 16. B[pos] ← 1
-		op2->SetIndex(i);
+		op2->SetIndex(i_l);
 		for (; off2->GetIndex() < n; ++(*off2)) {
 			if (!off2->Compare(*op2)) {
 				break;
 			}
 			const auto p2 = p[off2->GetIndex()];
-			if (li[p2] < 0) {
+			auto pair = j_r_index[p2];
+			if (pair.first < 0) {
 				// Only mark rhs matches.
 				// bit_mask.SetValid(p2);
 				// bloom_filter.SetValid(p2 / BLOOM_CHUNK_BITS);
 				id_t end;
+				idx_t p2 = pair.second;
 				auto next = id_map.lower_bound(p2);
 				auto prev = next;
 				if (next != id_map.begin()) {
@@ -567,12 +588,16 @@ bool IEJoinUnion::NextRow() {
 		// Find the leftmost off1 where L1[pos] op1 L1[off1..n]
 		// These are the rows that satisfy the op1 condition
 		// and that is where we should start scanning B from
-		j = SearchL1(pos);
+		j_r = SearchL1(pos);
+		if (j_r >= n) {
+			continue;
+		}
+		j_r = j_r_index[j_r].second;
 
-		id_iter = id_map.lower_bound(j);
+		id_iter = id_map.lower_bound(j_r);
 		if (id_iter != id_map.begin()) {
 			auto prev = std::prev(id_iter);
-			if (j < prev->second) {
+			if (j_r < prev->second) {
 				id_iter = prev;
 			}
 		}
@@ -627,7 +652,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 	idx_t result_count = 0;
 
 	// 11. for(i←1 to n) do
-	while (i < n) {
+	while (i_l < n) {
 		// 13. for (j ← pos+eqOff to n) do
 		// for (;;) {
 		// 	// 14. if B[j] = 1 then
@@ -664,27 +689,27 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 		// }
 
 		for (; id_iter != id_map.end(); ++id_iter) {
-			auto start = MaxValue(id_iter->first, j);
+			auto start = MaxValue(id_iter->first, j_r);
 			auto end = id_iter->second;
 			auto rest = STANDARD_VECTOR_SIZE - result_count;
 			auto tims = MinValue(rest, end - start);
 			for (auto t = 0; t < tims; ++start, ++t) {
 				// Filter out tuples with the same sign (they come from the same table)
-				const auto rrid = li[start];
-				D_ASSERT(lrid > 0 && rrid < 0);
+				const auto rrid = li_r[start];
+				// D_ASSERT(lrid > 0 && rrid < 0);
 				// 15. add tuples w.r.t. (L1[j], L1[i]) to join result
 				lsel.set_index(result_count + t, sel_t(+lrid - 1));
-				rsel.set_index(result_count + t, sel_t(-rrid - 1));
+				rsel.set_index(result_count + t, sel_t(rrid - 1));
 			}
 			result_count += tims;
-			j = start;
+			j_r = start;
 			if (result_count == STANDARD_VECTOR_SIZE) {
 				// out of space!
 				return result_count;
 			}
 		}
 
-		++i;
+		++i_l;
 
 		if (!NextRow()) {
 			break;
