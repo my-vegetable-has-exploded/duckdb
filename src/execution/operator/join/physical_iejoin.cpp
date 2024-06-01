@@ -689,6 +689,12 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 		// }
 
 		for (; id_iter != id_map.end(); ++id_iter) {
+			// skip the range that is less than j_r
+			// It may be due to an early return caused by the exhaustion of the SelectionVector.
+			if (j_r >= id_iter->second) {
+				continue;
+			}
+			D_ASSERT(j_r < id_iter->second);
 			auto start = MaxValue(id_iter->first, j_r);
 			auto end = id_iter->second;
 			auto rest = STANDARD_VECTOR_SIZE - result_count;
@@ -699,7 +705,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 				// D_ASSERT(lrid > 0 && rrid < 0);
 				// 15. add tuples w.r.t. (L1[j], L1[i]) to join result
 				lsel.set_index(result_count + t, sel_t(+lrid - 1));
-				rsel.set_index(result_count + t, sel_t(rrid - 1));
+				rsel.set_index(result_count + t, sel_t(+rrid - 1));
 			}
 			result_count += tims;
 			j_r = start;
