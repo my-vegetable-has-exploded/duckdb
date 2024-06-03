@@ -241,6 +241,8 @@ struct IEJoinUnion {
 	idx_t SearchL1(idx_t pos);
 	bool NextRow();
 
+	int64_t MapCount();
+
 	//! Inverted loop
 	idx_t JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel);
 
@@ -260,6 +262,7 @@ struct IEJoinUnion {
 
 	btree::btree_map<idx_t, idx_t> id_map;
 	btree::btree_map<idx_t, idx_t>::iterator id_iter;
+	int64_t map_cnt;
 	// //! B
 	// vector<validity_t> bit_array;
 	// ValidityMask bit_mask;
@@ -469,6 +472,7 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
 	id_map.clear();
+	map_cnt = 0;
 	id_iter = id_map.end();
 	// bit_array.resize(ValidityMask::EntryCount(n), 0);
 	// bit_mask.Initialize(bit_array.data());
@@ -534,6 +538,14 @@ idx_t IEJoinUnion::SearchL1(idx_t pos) {
 	return lo;
 }
 
+int64_t IEJoinUnion::MapCount() {
+	int64_t cnt = 0;
+	for (auto iter = id_map.begin(); iter != id_map.end(); ++iter) {
+		cnt += iter->second - iter->first;
+	}
+	return cnt;
+}
+
 bool IEJoinUnion::NextRow() {
 	for (; i_l < n; ++i_l) {
 		// 12. pos ← P[i]
@@ -563,12 +575,16 @@ bool IEJoinUnion::NextRow() {
 					prev = std::prev(next);
 					if (prev->second == p2) {
 						if (next != id_map.end() && next->first == p2 + 1) {
-							end = next->second;
+							prev->second = next->second;
+							// erase may invalidate the iterator, so we need to update before erasing
 							id_map.erase(next);
 						} else {
-							end = p2 + 1;
+							prev->second = p2 + 1;
 						}
-						prev->second = end;
+
+						D_ASSERT(MapCount() == map_cnt + 1);
+						map_cnt++;
+
 						continue;
 					}
 				}
@@ -579,6 +595,9 @@ bool IEJoinUnion::NextRow() {
 				} else {
 					id_map[p2] = p2 + 1;
 				}
+
+				D_ASSERT(MapCount() == map_cnt + 1);
+				map_cnt++;
 			}
 		}
 
