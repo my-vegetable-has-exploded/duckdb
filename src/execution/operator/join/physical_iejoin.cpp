@@ -5,6 +5,7 @@
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/sort/sort.hpp"
 #include "duckdb/common/sort/sorted_block.hpp"
+#include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -254,7 +255,7 @@ struct IEJoinUnion {
 	//! Li
 	vector<int64_t> li;
 	//!	check the number index of the right table
-	vector<pair<int64_t, int64_t>> j_r_index;
+	vector<pair<int64_t, idx_t>> j_r_index;
 	//! only keep the right table index from li
 	vector<int64_t> li_r;
 	//! P
@@ -567,7 +568,7 @@ bool IEJoinUnion::NextRow() {
 				// Only mark rhs matches.
 				// bit_mask.SetValid(p2);
 				// bloom_filter.SetValid(p2 / BLOOM_CHUNK_BITS);
-				id_t end;
+				idx_t end;
 				idx_t p2 = pair.second;
 				auto next = id_map.lower_bound(p2);
 				auto prev = next;
@@ -718,7 +719,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 			auto end = id_iter->second;
 			auto rest = STANDARD_VECTOR_SIZE - result_count;
 			auto tims = MinValue(rest, end - start);
-			for (auto t = 0; t < tims; ++start, ++t) {
+			for (idx_t t = 0; t < tims; ++start, ++t) {
 				// Filter out tuples with the same sign (they come from the same table)
 				const auto rrid = li_r[start];
 				// D_ASSERT(lrid > 0 && rrid < 0);
