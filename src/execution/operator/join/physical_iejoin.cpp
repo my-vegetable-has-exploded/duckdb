@@ -4,7 +4,10 @@
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/sort/sort.hpp"
 #include "duckdb/common/sort/sorted_block.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/vector_size.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/event.hpp"
@@ -13,6 +16,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <thread>
+#include <utility>
 
 namespace duckdb {
 
@@ -237,8 +241,9 @@ struct IEJoinUnion {
 	IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, SortedTable &t1, const idx_t b1, SortedTable &t2,
 	            const idx_t b2);
 
-	idx_t SearchL1(idx_t pos);
 	bool NextRow();
+
+	bool NextInterval();
 
 	//! Inverted loop
 	idx_t JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel);
@@ -253,20 +258,21 @@ struct IEJoinUnion {
 	//! P
 	vector<idx_t> p;
 
-	//! B
-	vector<validity_t> bit_array;
-	ValidityMask bit_mask;
+	//! merge sort array for iejoin, contains the permutation index and initial rid
+	vector<pair<idx_t, int64_t>> merge_vector;
+	vector<pair<idx_t, int64_t>> merge_backup;
+	vector<idx_t> right_table_indexes;
 
-	//! Bloom Filter
-	static constexpr idx_t BLOOM_CHUNK_BITS = 1024;
-	idx_t bloom_count;
-	vector<validity_t> bloom_array;
-	ValidityMask bloom_filter;
-
-	//! Iteration state
+	//! merge sort iteration state
 	idx_t n;
-	idx_t i;
-	idx_t j;
+	idx_t l_index;
+	idx_t r_index;
+	idx_t p_result;
+	idx_t p_merge;
+	pair<idx_t, idx_t> left_range;
+	pair<idx_t, idx_t> right_range;
+	queue<pair<idx_t, idx_t>> intervals;
+
 	unique_ptr<SBIterator> op1;
 	unique_ptr<SBIterator> off1;
 	unique_ptr<SBIterator> op2;
@@ -346,7 +352,7 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 
 IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, SortedTable &t1, const idx_t b1,
                          SortedTable &t2, const idx_t b2)
-    : n(0), i(0) {
+    : n(0), l_index(0) {
 	// input : query Q with 2 join predicates t1.X op1 t2.X' and t1.Y op2 t2.Y', tables T, T' of sizes m and n resp.
 	// output: a list of tuple pairs (ti , tj)
 	// Note that T/T' are already sorted on X/X' and contain the payload data
@@ -446,188 +452,152 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 
 	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
-	bit_array.resize(ValidityMask::EntryCount(n), 0);
-	bit_mask.Initialize(bit_array.data());
+	merge_vector.resize(n);
+	merge_backup.resize(n);
 
-	// Bloom filter
-	bloom_count = (n + (BLOOM_CHUNK_BITS - 1)) / BLOOM_CHUNK_BITS;
-	bloom_array.resize(ValidityMask::EntryCount(bloom_count), 0);
-	bloom_filter.Initialize(bloom_array.data());
+	if (!op1->cmp) {
+		// L1 loose inequality
+		// TODO optimize it by using the sort payload directly
+		for (idx_t i = 0; i < n; ++i) {
+			merge_vector[i] = {p[i], li[p[i]]};
+		}
+	} else {
+		// L1 strict inequality
+		vector<idx_t> l1_order(n);
+		for (idx_t i = 0; i < n; ++i) {
+			op1->SetIndex(i);
+			l1_order[i] = i;
+			idx_t j = i + 1;
+			for (; j < n; ++j) {
+				off1->SetIndex(j);
+				if (op1->Compare(*off1)) {
+					break;
+				}
+				l1_order[j] = i;
+			}
+		}
+		for (idx_t i = 0; i < n; ++i) {
+			merge_vector[i] = {l1_order[p[i]], li[p[i]]};
+		}
+	}
 
 	// 11. for(i←1 to n) do
 	const auto &cmp2 = op.conditions[1].comparison;
 	op2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
 	off2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
-	i = 0;
-	j = 0;
+
+	if (!op2->cmp) {
+		// L2 loose inequality
+		for (idx_t i = 0; i < n; ++i) {
+			intervals.emplace(i, i);
+		}
+	} else {
+		// L2 strict inequality
+		for (idx_t i = 0; i < n; ++i) {
+			op2->SetIndex(i);
+			idx_t j = i + 1;
+			for (; j < n; ++j) {
+				off2->SetIndex(j);
+				if (op2->Compare(*off2)) {
+					break;
+				}
+			}
+			intervals.emplace(i, j - 1);
+			i = j - 1;
+		}
+	}
+
+	l_index = 0;
+	r_index = 0;
+	p_result = 0;
+	// empty range
+	left_range = {-1, -1};
+	right_range = {n, -1};
 	(void)NextRow();
 }
 
-idx_t IEJoinUnion::SearchL1(idx_t pos) {
-	// Perform an exponential search in the appropriate direction
-	op1->SetIndex(pos);
-
-	idx_t step = 1;
-	auto hi = pos;
-	auto lo = pos;
-	if (!op1->cmp) {
-		// Scan left for loose inequality
-		lo -= MinValue(step, lo);
-		step *= 2;
-		off1->SetIndex(lo);
-		while (lo > 0 && op1->Compare(*off1)) {
-			hi = lo;
-			lo -= MinValue(step, lo);
-			step *= 2;
-			off1->SetIndex(lo);
-		}
-	} else {
-		// Scan right for strict inequality
-		hi += MinValue(step, n - hi);
-		step *= 2;
-		off1->SetIndex(hi);
-		while (hi < n && !op1->Compare(*off1)) {
-			lo = hi;
-			hi += MinValue(step, n - hi);
-			step *= 2;
-			off1->SetIndex(hi);
-		}
+bool IEJoinUnion::NextInterval() {
+	if (intervals.size() < 2) {
+		return false;
 	}
 
-	// Binary search the target area
-	while (lo < hi) {
-		const auto mid = lo + (hi - lo) / 2;
-		off1->SetIndex(mid);
-		if (op1->Compare(*off1)) {
-			hi = mid;
-		} else {
-			lo = mid + 1;
-		}
+	auto &left_interval = intervals.front();
+	intervals.pop();
+
+	if (left_interval.second == n - 1) {
+		// cloudn't find left and right in [0..n)
+		intervals.push(left_interval);
+		return NextInterval();
 	}
 
-	off1->SetIndex(lo);
-
-	return lo;
+	r_index = left_interval.second;
+	auto &right_interval = intervals.front();
+	intervals.pop();
+	l_index = right_interval.second;
+	intervals.emplace(left_interval.first, right_interval.second);
+	left_range = left_interval;
+	right_range = right_interval;
+	p_merge = right_interval.second;
+	return true;
 }
 
 bool IEJoinUnion::NextRow() {
-	for (; i < n; ++i) {
-		// 12. pos ← P[i]
-		auto pos = p[i];
-		lrid = li[pos];
-		if (lrid < 0) {
-			continue;
+	while (true) {
+		for (; l_index >= right_range.first; --l_index) {
+
+			while (r_index >= left_range.first && merge_vector[r_index].first > merge_vector[l_index].first) {
+				merge_backup[p_merge] = merge_vector[r_index];
+				if (merge_vector[r_index].second < 0) {
+					right_table_indexes.push_back((idx_t)-merge_vector[r_index].second);
+				}
+				--p_merge;
+				--r_index;
+			}
+
+			merge_backup[p_merge] = merge_vector[l_index];
+			--p_merge;
+
+			// get pair(l,r) where p[l] < p[r] matching order1 requirement and l > r matching order2 requirement
+			if (merge_vector[l_index].second > 0) {
+				p_result = 0;
+				return true;
+			}
 		}
 
-		// 16. B[pos] ← 1
-		op2->SetIndex(i);
-		for (; off2->GetIndex() < n; ++(*off2)) {
-			if (!off2->Compare(*op2)) {
-				break;
-			}
-			const auto p2 = p[off2->GetIndex()];
-			if (li[p2] < 0) {
-				// Only mark rhs matches.
-				bit_mask.SetValid(p2);
-				bloom_filter.SetValid(p2 / BLOOM_CHUNK_BITS);
-			}
+		for (idx_t i = p_merge + 1; i <= right_range.second; ++i) {
+			merge_vector[i] = merge_backup[i];
 		}
+		right_table_indexes.clear();
 
-		// 9.  if (op1 ∈ {≤,≥} and op2 ∈ {≤,≥}) eqOff = 0
-		// 10. else eqOff = 1
-		// No, because there could be more than one equal value.
-		// Find the leftmost off1 where L1[pos] op1 L1[off1..n]
-		// These are the rows that satisfy the op1 condition
-		// and that is where we should start scanning B from
-		j = SearchL1(pos);
-
-		return true;
+		if (!NextInterval()) {
+			return false;
+		}
 	}
 	return false;
-}
-
-static idx_t NextValid(const ValidityMask &bits, idx_t j, const idx_t n) {
-	if (j >= n) {
-		return n;
-	}
-
-	// We can do a first approximation by checking entries one at a time
-	// which gives 64:1.
-	idx_t entry_idx, idx_in_entry;
-	bits.GetEntryIndex(j, entry_idx, idx_in_entry);
-	auto entry = bits.GetValidityEntry(entry_idx++);
-
-	// Trim the bits before the start position
-	entry &= (ValidityMask::ValidityBuffer::MAX_ENTRY << idx_in_entry);
-
-	// Check the non-ragged entries
-	for (const auto entry_count = bits.EntryCount(n); entry_idx < entry_count; ++entry_idx) {
-		if (entry) {
-			for (; idx_in_entry < bits.BITS_PER_VALUE; ++idx_in_entry, ++j) {
-				if (bits.RowIsValid(entry, idx_in_entry)) {
-					return j;
-				}
-			}
-		} else {
-			j += bits.BITS_PER_VALUE - idx_in_entry;
-		}
-
-		entry = bits.GetValidityEntry(entry_idx);
-		idx_in_entry = 0;
-	}
-
-	// Check the final entry
-	for (; j < n; ++idx_in_entry, ++j) {
-		if (bits.RowIsValid(entry, idx_in_entry)) {
-			return j;
-		}
-	}
-
-	return j;
 }
 
 idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel) {
 	// 8. initialize join result as an empty list for tuple pairs
 	idx_t result_count = 0;
 
-	// 11. for(i←1 to n) do
-	while (i < n) {
-		// 13. for (j ← pos+eqOff to n) do
-		for (;;) {
-			// 14. if B[j] = 1 then
+	// if any result rest from the previous iteration, use it
+	while (p_result < right_table_indexes.size()) {
 
-			//	Use the Bloom filter to find candidate blocks
-			while (j < n) {
-				auto bloom_begin = NextValid(bloom_filter, j / BLOOM_CHUNK_BITS, bloom_count) * BLOOM_CHUNK_BITS;
-				auto bloom_end = MinValue<idx_t>(n, bloom_begin + BLOOM_CHUNK_BITS);
-
-				j = MaxValue<idx_t>(j, bloom_begin);
-				j = NextValid(bit_mask, j, bloom_end);
-				if (j < bloom_end) {
-					break;
-				}
-			}
-
-			if (j >= n) {
-				break;
-			}
-
-			// Filter out tuples with the same sign (they come from the same table)
-			const auto rrid = li[j];
-			++j;
-
-			D_ASSERT(lrid > 0 && rrid < 0);
-			// 15. add tuples w.r.t. (L1[j], L1[i]) to join result
-			lsel.set_index(result_count, sel_t(+lrid - 1));
-			rsel.set_index(result_count, sel_t(-rrid - 1));
-			++result_count;
-			if (result_count == STANDARD_VECTOR_SIZE) {
-				// out of space!
-				return result_count;
-			}
+		idx_t rest = STANDARD_VECTOR_SIZE - result_count;
+		idx_t cnt = MinValue(rest, right_table_indexes.size() - p_result);
+		idx_t end = p_result + cnt;
+		for (; p_result < end; ++p_result) {
+			lsel.set_index(result_count, sel_t(lrid - 1));
+			rsel.set_index(result_count, sel_t(right_table_indexes[p_result] - 1));
 		}
-		++i;
+		result_count += cnt;
 
+		if (result_count == STANDARD_VECTOR_SIZE) {
+			// out of space!
+			return result_count;
+		}
+
+		--l_index;
 		if (!NextRow()) {
 			break;
 		}
