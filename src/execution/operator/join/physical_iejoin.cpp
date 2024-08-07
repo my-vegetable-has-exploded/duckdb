@@ -15,6 +15,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
+#include <sys/_types/_int64_t.h>
 #include <thread>
 #include <utility>
 
@@ -265,13 +266,13 @@ struct IEJoinUnion {
 
 	//! merge sort iteration state
 	idx_t n;
-	idx_t l_index;
-	idx_t r_index;
+	int64_t l_index;
+	int64_t r_index;
 	idx_t p_result;
-	idx_t p_merge;
-	pair<idx_t, idx_t> left_range;
-	pair<idx_t, idx_t> right_range;
-	queue<pair<idx_t, idx_t>> intervals;
+	int64_t p_merge;
+	pair<int64_t, int64_t> left_range;
+	pair<int64_t, int64_t> right_range;
+	queue<pair<int64_t, int64_t>> intervals;
 
 	unique_ptr<SBIterator> op1;
 	unique_ptr<SBIterator> off1;
@@ -510,6 +511,7 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	l_index = 0;
 	r_index = 0;
 	p_result = 0;
+	p_merge = 0;
 	// empty range
 	left_range = {-1, -1};
 	right_range = {n, -1};
@@ -524,7 +526,7 @@ bool IEJoinUnion::NextInterval() {
 	auto &left_interval = intervals.front();
 	intervals.pop();
 
-	if (left_interval.second == n - 1) {
+	if (left_interval.second == (int64_t)(n - 1)) {
 		// cloudn't find left and right in [0..n)
 		intervals.push(left_interval);
 		return NextInterval();
@@ -543,9 +545,9 @@ bool IEJoinUnion::NextInterval() {
 
 bool IEJoinUnion::NextRow() {
 	while (true) {
-		for (; l_index >= right_range.first; --l_index) {
+		while (l_index >= right_range.first) {
 
-			while (r_index >= left_range.first && merge_vector[r_index].first > merge_vector[l_index].first) {
+			while (r_index >= left_range.first && merge_vector[r_index].first >= merge_vector[l_index].first) {
 				merge_backup[p_merge] = merge_vector[r_index];
 				if (merge_vector[r_index].second < 0) {
 					right_table_indexes.push_back((idx_t)-merge_vector[r_index].second);
@@ -557,14 +559,17 @@ bool IEJoinUnion::NextRow() {
 			merge_backup[p_merge] = merge_vector[l_index];
 			--p_merge;
 
-			// get pair(l,r) where p[l] < p[r] matching order1 requirement and l > r matching order2 requirement
+			// get pair(l,r) where p[l] <= p[r] matching order1 requirement and l > r matching order2 requirement
 			if (merge_vector[l_index].second > 0) {
 				p_result = 0;
+				lrid = merge_vector[l_index].second;
 				return true;
 			}
+
+			--l_index;
 		}
 
-		for (idx_t i = p_merge + 1; i <= right_range.second; ++i) {
+		for (int64_t i = p_merge + 1; i <= right_range.second; ++i) {
 			merge_vector[i] = merge_backup[i];
 		}
 		right_table_indexes.clear();
@@ -580,21 +585,22 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 	// 8. initialize join result as an empty list for tuple pairs
 	idx_t result_count = 0;
 
-	// if any result rest from the previous iteration, use it
-	while (p_result < right_table_indexes.size()) {
+	// skip the table pair if there is no overlap
+	while (n > 0) {
+		// if any result rest from the previous iteration, use it
+		if (p_result < right_table_indexes.size()) {
+			idx_t cnt = MinValue(STANDARD_VECTOR_SIZE - result_count, right_table_indexes.size() - p_result);
+			idx_t end = p_result + cnt;
+			for (; p_result < end; ++p_result) {
+				lsel.set_index(result_count, sel_t(lrid - 1));
+				rsel.set_index(result_count, sel_t(right_table_indexes[p_result] - 1));
+				++result_count;
+			}
 
-		idx_t rest = STANDARD_VECTOR_SIZE - result_count;
-		idx_t cnt = MinValue(rest, right_table_indexes.size() - p_result);
-		idx_t end = p_result + cnt;
-		for (; p_result < end; ++p_result) {
-			lsel.set_index(result_count, sel_t(lrid - 1));
-			rsel.set_index(result_count, sel_t(right_table_indexes[p_result] - 1));
-		}
-		result_count += cnt;
-
-		if (result_count == STANDARD_VECTOR_SIZE) {
-			// out of space!
-			return result_count;
+			if (result_count == STANDARD_VECTOR_SIZE) {
+				// out of space!
+				return result_count;
+			}
 		}
 
 		--l_index;
