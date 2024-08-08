@@ -450,6 +450,10 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 
 	// 6. compute the permutation array P of L2 w.r.t. L1
 	p = ExtractColumn<idx_t>(*l2, types.size() - 1);
+	const auto &cmp2 = op.conditions[1].comparison;
+	l2->global_sort_state.Print();
+	op2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
+	off2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
 
 	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
@@ -482,11 +486,6 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 		}
 	}
 
-	// 11. for(i←1 to n) do
-	const auto &cmp2 = op.conditions[1].comparison;
-	op2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
-	off2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
-
 	if (!op2->cmp) {
 		// L2 loose inequality
 		for (idx_t i = 0; i < n; ++i) {
@@ -495,6 +494,7 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	} else {
 		// L2 strict inequality
 		for (idx_t i = 0; i < n; ++i) {
+			// TODO optimize op usage by using ++ operator
 			op2->SetIndex(i);
 			idx_t j = i + 1;
 			for (; j < n; ++j) {
