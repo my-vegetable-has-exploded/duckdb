@@ -1,10 +1,14 @@
 #include "duckdb/execution/operator/join/physical_iejoin.hpp"
 
+#include "duckdb/common/assert.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/sort/sort.hpp"
 #include "duckdb/common/sort/sorted_block.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/vector_size.hpp"
@@ -13,8 +17,11 @@
 #include "duckdb/parallel/event.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <sys/_types/_int64_t.h>
 #include <thread>
 #include <utility>
@@ -242,6 +249,8 @@ struct IEJoinUnion {
 	IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, SortedTable &t1, const idx_t b1, SortedTable &t2,
 	            const idx_t b2);
 
+	void ProcessLIndex();
+
 	bool NextRow();
 
 	bool NextInterval();
@@ -279,6 +288,7 @@ struct IEJoinUnion {
 	unique_ptr<SBIterator> op2;
 	unique_ptr<SBIterator> off2;
 	int64_t lrid;
+	bool exhausted;
 };
 
 idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, SortedTable &marked, int64_t increment,
@@ -340,6 +350,9 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 		inserted += scan_count;
 		keys.Fuse(payload);
 
+		// Printer::Print("AppendKey");
+		// keys.Print();
+
 		// Flush when we have enough data
 		if (local_sort_state.SizeInBytes() >= marked.memory_per_thread) {
 			local_sort_state.Sort(marked.global_sort_state, true);
@@ -383,10 +396,12 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	// 3. else if (op1 ∈ {<, ≤}) sort L1 in ascending order
 
 	// For the union algorithm, we make a unified table with the keys and the rids as the payload:
-	//		X/X', Y/Y', R/R'/Li
+	//		X/X', Y/Y', T/F',R/R'/Li
 	// The first position is the sort key.
 	vector<LogicalType> types;
 	types.emplace_back(order2.expression->return_type);
+	// use to check whether the index is from the left table (true) or right table (false)
+	types.emplace_back(LogicalType::BOOLEAN);
 	types.emplace_back(LogicalType::BIGINT);
 	RowLayout payload_layout;
 	payload_layout.Initialize(types);
@@ -402,12 +417,16 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	ExpressionExecutor l_executor(context);
 	l_executor.AddExpression(*order1.expression);
 	l_executor.AddExpression(*order2.expression);
+	auto const_true = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	l_executor.AddExpression(*const_true);
 	AppendKey(t1, l_executor, *l1, 1, 1, b1);
 
 	// RHS has negative rids
 	ExpressionExecutor r_executor(context);
 	r_executor.AddExpression(*op.rhs_orders[0].expression);
 	r_executor.AddExpression(*op.rhs_orders[1].expression);
+	auto const_false = make_uniq<BoundConstantExpression>(Value::BOOLEAN(false));
+	r_executor.AddExpression(*const_false);
 	AppendKey(t2, r_executor, *l1, -1, -1, b2);
 
 	if (l1->global_sort_state.sorted_blocks.empty()) {
@@ -415,6 +434,9 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	}
 
 	Sort(*l1);
+
+	// Printer::Print("L1");
+	// l1->global_sort_state.Print();
 
 	op1 = make_uniq<SBIterator>(l1->global_sort_state, cmp1);
 	off1 = make_uniq<SBIterator>(l1->global_sort_state, cmp1);
@@ -435,9 +457,17 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	orders.clear();
 	ref = make_uniq<BoundReferenceExpression>(order2.expression->return_type, 0U);
 	orders.emplace_back(order2.type, order2.null_order, std::move(ref));
+	if (!SBIterator::ComparisonValue(op.conditions[1].comparison)) {
+		// if op2 is loose inequality, we need to put left table indexs after right table indexs
+		// and split the interval by the equality
+		auto table_positions = make_uniq<BoundReferenceExpression>(LogicalType::BOOLEAN, 1U);
+		orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_FIRST, std::move(table_positions));
+	}
 
 	ExpressionExecutor executor(context);
-	executor.AddExpression(*orders[0].expression);
+	for (auto &order : orders) {
+		executor.AddExpression(*order.expression);
+	}
 
 	l2 = make_uniq<SortedTable>(context, orders, payload_layout);
 	for (idx_t base = 0, block_idx = 0; block_idx < l1->BlockCount(); ++block_idx) {
@@ -445,67 +475,76 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	}
 
 	Sort(*l2);
+	// Printer::Print("L2");
+	// l2->global_sort_state.Print();
 
 	// We don't actually need the L2 column, just its sort key, which is in the sort blocks
 
 	// 6. compute the permutation array P of L2 w.r.t. L1
 	p = ExtractColumn<idx_t>(*l2, types.size() - 1);
 	const auto &cmp2 = op.conditions[1].comparison;
-	l2->global_sort_state.Print();
 	op2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
 	off2 = make_uniq<SBIterator>(l2->global_sort_state, cmp2);
 
-	// 7. initialize bit-array B (|B| = n), and set all bits to 0
 	n = l2->count.load();
 	merge_vector.resize(n);
 	merge_backup.resize(n);
 
+	// convert the permutation array to the order of column x, and handle the equality, so that we can check the order
+	// of column x by merge_vector[i].first
+	vector<idx_t> l1_order(n);
 	if (!op1->cmp) {
 		// L1 loose inequality
-		// TODO optimize it by using the sort payload directly
+		// if the sort key is the same, let the left table less than the right table so that we can split the interval
+		// and match the equalities
 		for (idx_t i = 0; i < n; ++i) {
-			merge_vector[i] = {p[i], li[p[i]]};
+			op1->SetIndex(i);
+			idx_t j = i;
+			for (; j < n; ++j) {
+				if (!op1->Equal(*off1)) {
+					break;
+				}
+				++(*off1);
+				// if the sort key is the same, let the left table less than the right table
+				l1_order[j] = li[j] > 0 ? (2 * i) : (2 * i) + 1;
+			}
+			i = j - 1;
 		}
 	} else {
 		// L1 strict inequality
-		vector<idx_t> l1_order(n);
 		for (idx_t i = 0; i < n; ++i) {
 			op1->SetIndex(i);
-			l1_order[i] = i;
-			idx_t j = i + 1;
+			idx_t j = i;
 			for (; j < n; ++j) {
-				off1->SetIndex(j);
-				if (op1->Compare(*off1)) {
+				if (!op1->Equal(*off1)) {
 					break;
 				}
+				++(*off1);
 				l1_order[j] = i;
 			}
-		}
-		for (idx_t i = 0; i < n; ++i) {
-			merge_vector[i] = {l1_order[p[i]], li[p[i]]};
+			i = j - 1;
 		}
 	}
 
-	if (!op2->cmp) {
-		// L2 loose inequality
-		for (idx_t i = 0; i < n; ++i) {
-			intervals.emplace(i, i);
-		}
-	} else {
-		// L2 strict inequality
-		for (idx_t i = 0; i < n; ++i) {
-			// TODO optimize op usage by using ++ operator
-			op2->SetIndex(i);
-			idx_t j = i + 1;
-			for (; j < n; ++j) {
-				off2->SetIndex(j);
-				if (op2->Compare(*off2)) {
-					break;
-				}
+	for (idx_t i = 0; i < n; ++i) {
+		// convert the permutation array to the order of column x and the index of the table
+		merge_vector[i] = {l1_order[p[i]], li[p[i]]};
+	}
+
+	for (idx_t i = 0; i < n; ++i) {
+		op2->SetIndex(i);
+		idx_t j = i;
+		for (; j < n; ++j) {
+			if (!op2->Equal(*off2)) {
+				break;
 			}
-			intervals.emplace(i, j - 1);
-			i = j - 1;
+			++(*off2);
 		}
+		intervals.emplace(i, j - 1);
+		// to use merge sort to gather all inversion pairs， we need to sort the interval by the order of column x first
+		// ly
+		std::sort(merge_vector.begin() + (ptrdiff_t)i, merge_vector.begin() + (ptrdiff_t)j);
+		i = j - 1;
 	}
 
 	l_index = 0;
@@ -513,13 +552,15 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	p_result = 0;
 	p_merge = 0;
 	// empty range
-	left_range = {-1, -1};
+	left_range = {n, -1};
 	right_range = {n, -1};
+	exhausted = false;
 	(void)NextRow();
 }
 
 bool IEJoinUnion::NextInterval() {
 	if (intervals.size() < 2) {
+		exhausted = true;
 		return false;
 	}
 
@@ -534,6 +575,7 @@ bool IEJoinUnion::NextInterval() {
 
 	r_index = left_interval.second;
 	auto &right_interval = intervals.front();
+	D_ASSERT(r_index < right_interval.first);
 	intervals.pop();
 	l_index = right_interval.second;
 	intervals.emplace(left_interval.first, right_interval.second);
@@ -543,32 +585,38 @@ bool IEJoinUnion::NextInterval() {
 	return true;
 }
 
+void IEJoinUnion::ProcessLIndex() {
+	merge_backup[p_merge] = merge_vector[l_index];
+	--p_merge;
+	--l_index;
+}
+
 bool IEJoinUnion::NextRow() {
 	while (true) {
 		while (l_index >= right_range.first) {
 
-			while (r_index >= left_range.first && merge_vector[r_index].first >= merge_vector[l_index].first) {
+			// merge from back to front
+			while (r_index >= left_range.first && merge_vector[r_index].first > merge_vector[l_index].first) {
 				merge_backup[p_merge] = merge_vector[r_index];
 				if (merge_vector[r_index].second < 0) {
+					// record the right table indexes that match the order requirement with current left table index
 					right_table_indexes.push_back((idx_t)-merge_vector[r_index].second);
 				}
 				--p_merge;
 				--r_index;
 			}
 
-			merge_backup[p_merge] = merge_vector[l_index];
-			--p_merge;
-
-			// get pair(l,r) where p[l] <= p[r] matching order1 requirement and l > r matching order2 requirement
+			// get pair(l,r) where m[l] < m[r] matching order1 requirement and l > r matching order2 requirement
 			if (merge_vector[l_index].second > 0) {
 				p_result = 0;
 				lrid = merge_vector[l_index].second;
 				return true;
 			}
 
-			--l_index;
+			ProcessLIndex();
 		}
 
+		// process interval change
 		for (int64_t i = p_merge + 1; i <= right_range.second; ++i) {
 			merge_vector[i] = merge_backup[i];
 		}
@@ -578,19 +626,19 @@ bool IEJoinUnion::NextRow() {
 			return false;
 		}
 	}
-	return false;
 }
 
 idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rsel) {
 	// 8. initialize join result as an empty list for tuple pairs
 	idx_t result_count = 0;
 
-	// skip the table pair if there is no overlap
-	while (n > 0) {
+	// skip the table pair if there is no overlap and check if the union is exhausted
+	while (n > 0 && exhausted == false) {
 		// if any result rest from the previous iteration, use it
 		if (p_result < right_table_indexes.size()) {
 			idx_t cnt = MinValue(STANDARD_VECTOR_SIZE - result_count, right_table_indexes.size() - p_result);
 			idx_t end = p_result + cnt;
+			// copy the result to the selection vector
 			for (; p_result < end; ++p_result) {
 				lsel.set_index(result_count, sel_t(lrid - 1));
 				rsel.set_index(result_count, sel_t(right_table_indexes[p_result] - 1));
@@ -603,7 +651,7 @@ idx_t IEJoinUnion::JoinComplexBlocks(SelectionVector &lsel, SelectionVector &rse
 			}
 		}
 
-		--l_index;
+		ProcessLIndex();
 		if (!NextRow()) {
 			break;
 		}
@@ -819,6 +867,23 @@ public:
 	void GetNextPair(ClientContext &client, IEJoinGlobalState &gstate, IEJoinLocalSourceState &lstate) {
 		auto &left_table = *gstate.tables[0];
 		auto &right_table = *gstate.tables[1];
+
+		// for (idx_t i = 0; i < 2; ++i) {
+		// 	auto &cond = op.conditions[i];
+		// 	// debug printer condition
+		// 	Printer::Print(StringUtil::Format("IEJoin condition %d", i));
+		// 	Printer::Print(cond.left->ToString());
+		// 	cond.left->Print();
+		// 	Printer::Print(ExpressionTypeToString(cond.comparison));
+		// 	Printer::Print(cond.right->ToString());
+		// 	cond.right->Print();
+		// }
+
+		// Printer::Print("left table");
+		// left_table.Print();
+
+		// Printer::Print("right table");
+		// right_table.Print();
 
 		const auto left_blocks = left_table.BlockCount();
 		const auto right_blocks = right_table.BlockCount();

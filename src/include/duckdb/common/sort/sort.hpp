@@ -269,6 +269,20 @@ struct SBIterator {
 		return Compare(other, sort_layout);
 	}
 
+	inline bool Equal(const SBIterator &other, const SortLayout &prefix) const {
+		int comp_res;
+		if (all_constant) {
+			comp_res = FastMemcmp(entry_ptr, other.entry_ptr, prefix.comparison_size);
+		} else {
+			comp_res = Comparators::CompareTuple(scan, other.scan, entry_ptr, other.entry_ptr, prefix, external);
+		}
+		return comp_res == 0;
+	}
+
+	inline bool Equal(const SBIterator &other) const {
+		return Equal(other, sort_layout);
+	}
+
 	// Fixed comparison parameters
 	const SortLayout &sort_layout;
 	const idx_t block_count;
