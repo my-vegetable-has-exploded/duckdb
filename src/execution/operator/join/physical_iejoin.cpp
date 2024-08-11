@@ -20,11 +20,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
-#include <algorithm>
-#include <cstddef>
-#include <sys/_types/_int64_t.h>
 #include <thread>
-#include <utility>
 
 namespace duckdb {
 
