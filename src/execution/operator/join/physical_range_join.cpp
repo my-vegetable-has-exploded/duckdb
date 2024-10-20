@@ -11,8 +11,8 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
-#include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parallel/executor_task.hpp"
+#include "duckdb/parallel/thread_context.hpp"
 
 #include <thread>
 
@@ -62,7 +62,7 @@ PhysicalRangeJoin::GlobalSortedTable::GlobalSortedTable(ClientContext &context, 
                                                         RowLayout &payload_layout)
     : global_sort_state(BufferManager::GetBufferManager(context), orders, payload_layout), has_null(0), count(0),
       memory_per_thread(0) {
-	D_ASSERT(orders.size() == 1);
+	// D_ASSERT(orders.size() == 1);
 
 	// Set external (can be forced with the PRAGMA)
 	auto &config = ClientConfig::GetConfig(context);

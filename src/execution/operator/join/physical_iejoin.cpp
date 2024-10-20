@@ -1,18 +1,23 @@
 #include "duckdb/execution/operator/join/physical_iejoin.hpp"
 
-#include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/sort/sort.hpp"
 #include "duckdb/common/sort/sorted_block.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/event.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
+#include <cstdint>
 #include <thread>
+#include <utility>
 
 namespace duckdb {
 
@@ -298,6 +303,7 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 
 	DataChunk keys;
 	DataChunk payload;
+	DataChunk index;
 	keys.Initialize(Allocator::DefaultAllocator(), types);
 
 	idx_t inserted = 0;
@@ -318,13 +324,27 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 
 		// Compute the input columns from the payload
 		keys.Reset();
+		// if (key_types.size() > 1) {
+		// 	keys.Split(index, 1);
+		// 	index.Split(payload, 1);
+		// 	keys.Fuse(payload);
+		// }
 		keys.Split(payload, rid_idx);
 		executor.Execute(scanned, keys);
 
 		// Mark the rid column
 		payload.data[0].Sequence(rid, increment, scan_count);
 		payload.SetCardinality(scan_count);
+		// if (key_types.size() > 1) {
+		// 	index.data[0];
+		// 	index.SetCardinality(scan_count);
+		// }
 		keys.Fuse(payload);
+		// if (key_types.size() > 1) {
+		// 	keys.Split(payload, 1);
+		// 	keys.Fuse(index);
+		// 	keys.Fuse(payload);
+		// }
 		rid += increment * UnsafeNumericCast<int64_t>(scan_count);
 
 		// Sort on the sort columns (which will no longer be needed)
@@ -332,6 +352,7 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 		local_sort_state.SinkChunk(keys, payload);
 		inserted += scan_count;
 		keys.Fuse(payload);
+		// keys.Print();
 
 		// Flush when we have enough data
 		if (local_sort_state.SizeInBytes() >= marked.memory_per_thread) {
@@ -388,18 +409,27 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	auto ref = make_uniq<BoundReferenceExpression>(order1.expression->return_type, 0U);
 	vector<BoundOrderByNode> orders;
 	orders.emplace_back(order1.type, order1.null_order, std::move(ref));
+	auto right_first = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	orders.emplace_back(SBIterator::ComparisonValue(cmp1) == 0 ? OrderType::DESCENDING : OrderType::ASCENDING,
+	                    OrderByNullType::ORDER_DEFAULT, std::move(right_first));
 
 	l1 = make_uniq<SortedTable>(context, orders, payload_layout);
 
 	// LHS has positive rids
 	ExpressionExecutor l_executor(context);
 	l_executor.AddExpression(*order1.expression);
+	// add const column 1_int
+	auto left_const = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	l_executor.AddExpression(*left_const);
 	l_executor.AddExpression(*order2.expression);
 	AppendKey(t1, l_executor, *l1, 1, 1, b1);
 
 	// RHS has negative rids
 	ExpressionExecutor r_executor(context);
 	r_executor.AddExpression(*op.rhs_orders[0].expression);
+	// add const column with -1
+	auto right_const = make_uniq<BoundConstantExpression>(Value::BOOLEAN(false));
+	r_executor.AddExpression(*right_const);
 	r_executor.AddExpression(*op.rhs_orders[1].expression);
 	AppendKey(t2, r_executor, *l1, -1, -1, b2);
 
@@ -408,6 +438,8 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	}
 
 	Sort(*l1);
+
+	// l1->Print();
 
 	op1 = make_uniq<SBIterator>(l1->global_sort_state, cmp1);
 	off1 = make_uniq<SBIterator>(l1->global_sort_state, cmp1);
@@ -463,53 +495,6 @@ IEJoinUnion::IEJoinUnion(ClientContext &context, const PhysicalIEJoin &op, Sorte
 	(void)NextRow();
 }
 
-idx_t IEJoinUnion::SearchL1(idx_t pos) {
-	// Perform an exponential search in the appropriate direction
-	op1->SetIndex(pos);
-
-	idx_t step = 1;
-	auto hi = pos;
-	auto lo = pos;
-	if (!op1->cmp) {
-		// Scan left for loose inequality
-		lo -= MinValue(step, lo);
-		step *= 2;
-		off1->SetIndex(lo);
-		while (lo > 0 && op1->Compare(*off1)) {
-			hi = lo;
-			lo -= MinValue(step, lo);
-			step *= 2;
-			off1->SetIndex(lo);
-		}
-	} else {
-		// Scan right for strict inequality
-		hi += MinValue(step, n - hi);
-		step *= 2;
-		off1->SetIndex(hi);
-		while (hi < n && !op1->Compare(*off1)) {
-			lo = hi;
-			hi += MinValue(step, n - hi);
-			step *= 2;
-			off1->SetIndex(hi);
-		}
-	}
-
-	// Binary search the target area
-	while (lo < hi) {
-		const auto mid = lo + (hi - lo) / 2;
-		off1->SetIndex(mid);
-		if (op1->Compare(*off1)) {
-			hi = mid;
-		} else {
-			lo = mid + 1;
-		}
-	}
-
-	off1->SetIndex(lo);
-
-	return lo;
-}
-
 bool IEJoinUnion::NextRow() {
 	for (; i < n; ++i) {
 		// 12. pos ← P[i]
@@ -539,7 +524,7 @@ bool IEJoinUnion::NextRow() {
 		// Find the leftmost off1 where L1[pos] op1 L1[off1..n]
 		// These are the rows that satisfy the op1 condition
 		// and that is where we should start scanning B from
-		j = SearchL1(pos);
+		j = pos;
 
 		return true;
 	}
