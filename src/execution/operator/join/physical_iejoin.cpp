@@ -303,7 +303,6 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 
 	DataChunk keys;
 	DataChunk payload;
-	DataChunk index;
 	keys.Initialize(Allocator::DefaultAllocator(), types);
 
 	idx_t inserted = 0;
@@ -324,27 +323,13 @@ idx_t IEJoinUnion::AppendKey(SortedTable &table, ExpressionExecutor &executor, S
 
 		// Compute the input columns from the payload
 		keys.Reset();
-		// if (key_types.size() > 1) {
-		// 	keys.Split(index, 1);
-		// 	index.Split(payload, 1);
-		// 	keys.Fuse(payload);
-		// }
 		keys.Split(payload, rid_idx);
 		executor.Execute(scanned, keys);
 
 		// Mark the rid column
 		payload.data[0].Sequence(rid, increment, scan_count);
 		payload.SetCardinality(scan_count);
-		// if (key_types.size() > 1) {
-		// 	index.data[0];
-		// 	index.SetCardinality(scan_count);
-		// }
 		keys.Fuse(payload);
-		// if (key_types.size() > 1) {
-		// 	keys.Split(payload, 1);
-		// 	keys.Fuse(index);
-		// 	keys.Fuse(payload);
-		// }
 		rid += increment * UnsafeNumericCast<int64_t>(scan_count);
 
 		// Sort on the sort columns (which will no longer be needed)
